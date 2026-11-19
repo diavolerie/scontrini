@@ -1,6 +1,7 @@
+streamlit
 numpy
 opencv-python-headless
 Pillow
 pytesseract
 PyMuPDF
-streamlit
+streamlit-image-coordinates
