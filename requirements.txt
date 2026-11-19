@@ -1,5 +1,6 @@
 numpy
-opencv-python
+opencv-python-headless
 Pillow
 pytesseract
 PyMuPDF
+streamlit
