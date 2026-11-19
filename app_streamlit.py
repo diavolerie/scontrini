@@ -1,7 +1,11 @@
 import io
+import zipfile
+from pathlib import Path
+
+import cv2
+import numpy as np
 import streamlit as st
 from PIL import Image
-import fitz  # PyMuPDF
 
 st.set_page_config(
     page_title="Scontrini PDF",
@@ -10,21 +14,15 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Stile simile all'app originale: crema, pannelli chiari, accenti arancio/verde
 st.markdown(
     """
     <style>
-      .stApp {
-          background-color: #E6DFCB;
-          color: #1F2A24;
-      }
+      .stApp { background-color: #E6DFCB; color: #1F2A24; }
       section[data-testid="stSidebar"] {
           background-color: #EEE8D6;
           border-right: 1px solid #B9B19A;
       }
-      h1, h2, h3 {
-          color: #1F2A24;
-      }
+      h1, h2, h3 { color: #1F2A24; }
       .stButton > button {
           background-color: #F3EFE1;
           color: #1F2A24;
@@ -35,19 +33,6 @@ st.markdown(
       .stButton > button[kind="primary"] {
           background-color: #FF4F12;
           color: #FFFFFF;
-          border-color: #2A2A27;
-      }
-      .stSuccess {
-          background-color: #0B5B43;
-          color: #F3EFE1;
-      }
-      .stInfo {
-          background-color: #F7D9A0;
-          color: #1F2A24;
-      }
-      .stError {
-          background-color: #E8405A;
-          color: #FFFFFF;
       }
     </style>
     """,
@@ -55,7 +40,107 @@ st.markdown(
 )
 
 st.title("🧾 Scontrini PDF")
-st.caption("Versione web — Fase 2: caricamento, anteprime e preparazione analisi")
+st.caption("Versione web — Fase 3: riconoscimento crocini e ritaglio pagine")
+
+IMG_EXT = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp")
+
+
+def read_image(uploaded, rotate=False):
+    data = np.frombuffer(uploaded.getvalue(), dtype=np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    if rotate:
+        img = cv2.rotate(img, cv2.ROTATE_180)
+    return img
+
+
+def find_dark_marks(gray, min_area=40, max_area=2500):
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    marks = []
+
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+
+        if not (min_area <= area <= max_area):
+            continue
+
+        aspect = w / float(h)
+        if not (0.65 <= aspect <= 1.45):
+            continue
+
+        fill = area / float(w * h)
+        if fill < 0.12:
+            continue
+
+        marks.append(
+            {
+                "x": x + w / 2.0,
+                "y": y + h / 2.0,
+                "w": w,
+                "h": h,
+                "area": area,
+            }
+        )
+
+    return marks
+
+
+def pair_marks(marks, image_height, max_vertical_gap=0.45):
+    pairs = []
+
+    for i, top in enumerate(marks):
+        for bottom in marks[i + 1:]:
+            dx = abs(bottom["x"] - top["x"])
+            dy = bottom["y"] - top["y"]
+
+            if dy <= 10:
+                continue
+
+            if dx > max(top["w"], bottom["w"]) * 1.5:
+                continue
+
+            if dy > image_height * max_vertical_gap:
+                continue
+
+            pairs.append(
+                {
+                    "top": (top["x"], top["y"]),
+                    "bottom": (bottom["x"], bottom["y"]),
+                    "score": min(top["area"], bottom["area"]),
+                }
+            )
+
+    pairs.sort(key=lambda p: (p["top"][0], p["top"][1]))
+    return pairs
+
+
+def crop_between_marks(image, pair, margin=18, min_width=180, min_height=180):
+    height, width = image.shape[:2]
+    x1, y1 = pair["top"]
+    x2, y2 = pair["bottom"]
+
+    left = int(max(0, min(x1, x2) - margin))
+    right = int(min(width, max(x1, x2) + margin))
+    top = int(max(0, min(y1, y2) - margin))
+    bottom = int(min(height, max(y1, y2) + margin))
+
+    if right - left < min_width or bottom - top < min_height:
+        return None
+
+    return image[top:bottom, left:right].copy()
+
+
+def encode_image(image, extension):
+    ok, buffer = cv2.imencode(extension, image)
+    if not ok:
+        raise RuntimeError("Impossibile codificare l'immagine")
+    return buffer.tobytes()
+
 
 with st.sidebar:
     st.header("📁 Scansioni")
@@ -63,46 +148,26 @@ with st.sidebar:
         "Aggiungi scansioni",
         type=["png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp"],
         accept_multiple_files=True,
-        help="Puoi selezionare più immagini contemporaneamente.",
     )
 
-    st.header("📄 PDF di riferimento")
-    pdf = st.file_uploader("Carica PDF", type=["pdf"])
-
-    st.header("⚙️ Impostazioni")
-    soglia = st.slider(
-        "Soglia riconoscimento crocini",
-        0.10, 0.95, 0.50, 0.01,
-        help="Valori più bassi trovano più crocini, ma aumentano i falsi positivi.",
-    )
-
-    distanza = st.number_input(
-        "Distanza crocini D (px)",
-        min_value=0.0,
-        value=0.0,
-        step=10.0,
-        help="Lascia 0 per farla stimare automaticamente.",
+    st.header("⚙️ Analisi")
+    sensibilita = st.slider(
+        "Sensibilità riconoscimento",
+        1, 10, 5,
+        help="Aumentala se non trova crocini; diminuiscila se trova troppi falsi positivi.",
     )
 
     rotazione = st.checkbox("Ruota scansioni di 180°")
     formato = st.selectbox("Formato di uscita", ["png", "jpg"])
-    padding = st.number_input("Padding nome file", 0, 6, 2)
 
     st.divider()
     st.subheader("Stato")
-    if scans and pdf:
-        st.success("Pronto per l’analisi")
-    elif scans:
-        st.info("Scansioni caricate, PDF mancante")
-    elif pdf:
-        st.info("PDF caricato, scansioni mancanti")
-    else:
-        st.warning("Carica scansioni e PDF")
+    st.success("Motore crocini attivo") if scans else st.warning("Carica le scansioni")
 
 st.subheader("Scansioni caricate")
 
 if not scans:
-    st.info("Nessuna scansione caricata. Usa il pannello a sinistra.")
+    st.info("Carica una o più scansioni dal pannello a sinistra.")
 else:
     st.success(f"{len(scans)} scansioni caricate")
 
@@ -120,63 +185,95 @@ else:
                 st.error(f"Impossibile leggere `{uploaded.name}`: {ex}")
 
 st.divider()
-st.subheader("PDF di riferimento")
 
-if not pdf:
-    st.info("Nessun PDF caricato.")
-else:
-    try:
-        doc = fitz.open(stream=pdf.getvalue(), filetype="pdf")
-        st.success(f"PDF valido: **{doc.page_count} pagine**")
-        st.write(f"File: `{pdf.name}` — {len(pdf.getvalue()) / 1024:.0f} KB")
-
-        if doc.page_count > 0:
-            page = doc.load_page(0)
-            pix = page.get_pixmap(matrix=fitz.Matrix(0.35, 0.35), alpha=False)
-            first_page = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            st.image(first_page, caption="Prima pagina del PDF", use_container_width=True)
-
-        doc.close()
-    except Exception as ex:
-        st.error(f"Impossibile leggere il PDF: {ex}")
-
-st.divider()
-
-col1, col2, col3 = st.columns([2, 1, 1])
-
-with col1:
-    avvia = st.button(
-        "▶️ AVVIA ANALISI",
-        type="primary",
-        use_container_width=True,
-        disabled=not scans,
-    )
-
-with col2:
-    st.metric("Scansioni", len(scans) if scans else 0)
-
-with col3:
-    st.metric("Pagine PDF", doc.page_count if pdf else 0)
-
-if avvia:
+if st.button("▶️ AVVIA ANALISI", type="primary", use_container_width=True):
     if not scans:
         st.error("Carica almeno una scansione.")
     else:
-        with st.status("Analisi in preparazione…", expanded=True) as status:
-            st.write("Scansioni caricate correttamente.")
-            if pdf:
-                st.write("PDF caricato correttamente.")
-            else:
-                st.write("PDF non caricato: riconoscimento automatico non disponibile.")
+        results = []
+        errors = []
 
-            st.write(
-                f"Impostazioni: soglia {soglia:.2f}, D "
-                f"{'automatica' if distanza == 0 else f'{int(distanza)} px'}, "
-                f"rotazione {'attiva' if rotazione else 'disattivata'}."
+        progress = st.progress(0.0, text="Analisi delle scansioni…")
+
+        for index, uploaded in enumerate(scans):
+            try:
+                image = read_image(uploaded, rotazione)
+
+                if image is None:
+                    errors.append(f"{uploaded.name}: immagine non leggibile")
+                    continue
+
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                marks = find_dark_marks(gray)
+
+                if sensibilita >= 8:
+                    marks += find_dark_marks(gray, min_area=25, max_area=4000)
+
+                pairs = pair_marks(marks, image.shape[0])
+
+                if not pairs:
+                    errors.append(f"{uploaded.name}: nessun crocino accoppiato")
+                    continue
+
+                for number, pair in enumerate(pairs, start=1):
+                    crop = crop_between_marks(image, pair)
+
+                    if crop is None:
+                        continue
+
+                    results.append(
+                        {
+                            "scan": uploaded.name,
+                            "number": number,
+                            "image": crop,
+                        }
+                    )
+
+            except Exception as ex:
+                errors.append(f"{uploaded.name}: {ex}")
+
+            progress.progress((index + 1) / len(scans), text=f"Analizzata {uploaded.name}")
+
+        progress.empty()
+
+        st.subheader("Risultato analisi")
+
+        if not results:
+            st.error("Nessun ritaglio trovato. Prova ad aumentare la sensibilità o a ruotare le scansioni.")
+        else:
+            st.success(f"Trovati {len(results)} ritagli.")
+
+            cols = st.columns(3)
+
+            for i, result in enumerate(results):
+                with cols[i % 3]:
+                    st.image(
+                        cv2.cvtColor(result["image"], cv2.COLOR_BGR2RGB),
+                        caption=f"{result['scan']} — ritaglio {result['number']}",
+                        use_container_width=True,
+                    )
+
+            zip_buffer = io.BytesIO()
+            extension = ".png" if formato == "png" else ".jpg"
+
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+                for i, result in enumerate(results, start=1):
+                    base = Path(result["scan"]).stem
+                    filename = f"{base}_{i:03d}{extension}"
+                    archive.writestr(filename, encode_image(result["image"], extension))
+
+            st.download_button(
+                "⬇️ Scarica tutti i ritagli (ZIP)",
+                data=zip_buffer.getvalue(),
+                file_name="ritagli_scontrini.zip",
+                mime="application/zip",
+                use_container_width=True,
             )
 
-            st.write("Il motore di riconoscimento crocini sarà collegato nella Fase 3.")
-            status.update(label="Analisi pronta per la Fase 3", state="complete")
+        if errors:
+            with st.expander(f"⚠️ {len(errors)} avvisi o errori"):
+                for error in errors:
+                    st.write(f"- {error}")
 
 st.divider()
-st.caption("Scontrini PDF — interfaccia web in costruzione")
+st.caption("Fase 3: riconoscimento crocini e ritaglio. PDF, OCR e editor arriveranno nelle fasi successive.")
